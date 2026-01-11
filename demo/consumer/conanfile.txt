@@ -1,0 +1,5 @@
+[requires]
+mymath/1.0.0@demo/stable
+
+[generators]
+cmake
