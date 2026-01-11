@@ -1,12 +1,28 @@
 #!/bin/bash
 
 # Conan 1.x 端到端演示脚本
-set -e
+# 进入项目根目录
+cd "$(dirname "$0")/.."
 
 # 激活虚拟环境
 source venv/bin/activate
 
-API_ENDPOINT="https://48g7e6izq5.execute-api.ap-east-1.amazonaws.com"
+# 尝试从参数获取 API 端点，或者从 AWS CLI 自动获取
+API_ENDPOINT="${1}"
+if [ -z "$API_ENDPOINT" ]; then
+    echo "🔍 正在自动获取 API 端点..."
+    STACK_NAME=$(aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE --region ap-east-1 --query "StackSummaries[?contains(StackName, 'serverless-conan') && contains(StackName, 'ConanServerStack')].StackName" --output text | awk '{print $1}')
+    if [ -n "$STACK_NAME" ]; then
+        API_ENDPOINT=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region ap-east-1 --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
+    fi
+fi
+
+if [ -z "$API_ENDPOINT" ]; then
+    echo "❌ 错误: 未能获取 API 端点。请作为第一个参数提供，或者确保已部署。"
+    exit 1
+fi
+
+echo "📍 使用 API 端点: ${API_ENDPOINT}"
 export CONAN_TRACE_FILE="/tmp/conan_trace.log"
 
 echo "========================================="

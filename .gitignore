@@ -32,3 +32,11 @@ yarn-error.log*
 # Build
 dist/
 build/
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Demo build artifacts
+demo/consumer/build/

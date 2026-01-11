@@ -101,9 +101,9 @@ async function handleAuthentication(username: string, password: string, res: Res
         );
 
         const user = result.Item;
+        const passwordHash = crypto.createHash("sha256").update(password).digest("hex");
 
-        // 简单的密码验证（实际应用中应该使用 bcrypt 等）
-        if (user && user.password === password) {
+        if (user && (user.passwordHash === passwordHash || user.password === password)) {
             // 生成新 token (使用简单的随机字符串模拟 JWT)
             // 在实际 JWT 实现中，这里会签名一个 payload
             const token = crypto.randomBytes(32).toString("hex");
