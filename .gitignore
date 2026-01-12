@@ -1,16 +1,18 @@
+# .gitignore
+
 # Dependencies
 node_modules/
-package-lock.json
-yarn.lock
-pnpm-lock.yaml
+.pnp
+.pnp.js
 
 # SST
 .sst/
 .build/
 
-# Environment
+# Environment variables
 .env
 .env.local
+.env.*.local
 
 # IDE
 .vscode/
@@ -29,14 +31,22 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Build
+# Build outputs
 dist/
 build/
+*.tgz
+
+# Test outputs
+demo/consumer/build/
+demo/consumer/conanfile.txt
+demo/consumer/main.cpp
+demo/consumer/CMakeLists.txt
 
 # Python virtual environment
 venv/
 __pycache__/
 *.pyc
 
-# Demo build artifacts
-demo/consumer/build/
+# Temporary files
+/tmp/
+*.tmp

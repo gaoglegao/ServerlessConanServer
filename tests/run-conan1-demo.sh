@@ -7,13 +7,21 @@ cd "$(dirname "$0")/.."
 # 激活虚拟环境
 source venv/bin/activate
 
+# 优先从 .env 加载配置
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
+fi
+
+REGION=${AWS_REGION:-"ap-east-1"}
+export AWS_PROFILE=${AWS_PROFILE:-"conanserver"}
+
 # 尝试从参数获取 API 端点，或者从 AWS CLI 自动获取
 API_ENDPOINT="${1}"
 if [ -z "$API_ENDPOINT" ]; then
     echo "🔍 正在自动获取 API 端点..."
-    STACK_NAME=$(aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE --region ap-east-1 --query "StackSummaries[?contains(StackName, 'serverless-conan') && contains(StackName, 'ConanServerStack')].StackName" --output text | awk '{print $1}')
+    STACK_NAME=$(aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE --region "$REGION" --query "StackSummaries[?contains(StackName, 'serverless-conan') && contains(StackName, 'ConanServerStack')].StackName" --output text | awk '{print $1}')
     if [ -n "$STACK_NAME" ]; then
-        API_ENDPOINT=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region ap-east-1 --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
+        API_ENDPOINT=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
     fi
 fi
 
@@ -21,6 +29,9 @@ if [ -z "$API_ENDPOINT" ]; then
     echo "❌ 错误: 未能获取 API 端点。请作为第一个参数提供，或者确保已部署。"
     exit 1
 fi
+
+ADMIN_USER=${CONAN_ADMIN_USER:-"admin"}
+ADMIN_PASS=${CONAN_ADMIN_PASS:-"admin123"}
 
 echo "📍 使用 API 端点: ${API_ENDPOINT}"
 export CONAN_TRACE_FILE="/tmp/conan_trace.log"
@@ -43,8 +54,8 @@ conan config set general.revisions_enabled=0
 conan config set general.verify_ssl=False
 
 # 登录
-echo "🔑 登录到 Serverless Server..."
-conan user admin -p admin123 -r my-serverless
+echo "🔑 登录到 Serverless Server ($ADMIN_USER)..."
+conan user "$ADMIN_USER" -p "$ADMIN_PASS" -r my-serverless
 
 echo "========================================="
 echo "📦 步骤 1: 创建 Conan 包 (mymath/1.0.0)"

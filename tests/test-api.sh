@@ -2,7 +2,20 @@
 
 # Serverless Conan Server API 测试脚本
 
-API_ENDPOINT="https://48g7e6izq5.execute-api.ap-east-1.amazonaws.com"
+# 优先从 .env 加载配置
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
+fi
+
+REGION=${AWS_REGION:-"ap-east-1"}
+export AWS_PROFILE=${AWS_PROFILE:-"conanserver"}
+
+# 自动获取 API 端点
+STACK_NAME=$(aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE --region "$REGION" --query "StackSummaries[?contains(StackName, 'serverless-conan') && contains(StackName, 'ConanServerStack')].StackName" --output text | awk '{print $1}')
+API_ENDPOINT=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" --output text)
+
+ADMIN_USER=${CONAN_ADMIN_USER:-"admin"}
+ADMIN_PASS=${CONAN_ADMIN_PASS:-"YOUR_PASSWORD"}
 
 echo "========================================="
 echo "Serverless Conan Server API 测试"
@@ -19,7 +32,7 @@ echo ""
 echo "2. 测试用户认证..."
 auth_response=$(curl -s -X POST "${API_ENDPOINT}/v1/users/authenticate" \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}')
+  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}")
 echo "认证响应: $auth_response"
 
 # 提取 token
@@ -73,8 +86,8 @@ echo "========================================="
 echo ""
 echo "总结:"
 echo "- API 端点: $API_ENDPOINT"
-echo "- 管理员用户名: admin"
-echo "- 管理员密码: admin123"
+echo "- 管理员用户名: $ADMIN_USER"
+echo "- 管理员密码: [已配置]"
 echo "- 认证 Token: $token"
 echo ""
 echo "所有核心 API 端点都已测试成功！"

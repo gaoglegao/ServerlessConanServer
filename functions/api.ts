@@ -20,6 +20,7 @@ const dynamo = DynamoDBDocumentClient.from(dynamoClient);
 const PACKAGES_BUCKET = process.env.PACKAGES_BUCKET_NAME!;
 const PACKAGES_TABLE = process.env.PACKAGES_TABLE_NAME!;
 const USERS_TABLE = process.env.USERS_TABLE_NAME!;
+const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE_NAME!;
 
 // 辅助函数：生成包的唯一 ID
 function getPackageId(name: string, version: string, user: string, channel: string): string {
@@ -28,16 +29,25 @@ function getPackageId(name: string, version: string, user: string, channel: stri
 
 // 辅助函数：从请求中提取认证信息
 function extractAuth(req: Request): string | null {
+    // 1. 优先从查询参数获取 (用于预签名 Proxy URL)
+    if (req.query.auth_token) return req.query.auth_token as string;
+
+    // 2. 从 Authorization 头部获取
     const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-        return authHeader.substring(7);
-    }
-    return null;
+    if (!authHeader) return null;
+
+    if (authHeader.startsWith("Bearer ")) return authHeader.substring(7);
+    if (authHeader.toLowerCase().startsWith("token ")) return authHeader.substring(6);
+    return authHeader;
 }
 
-// 辅助函数：验证用户令牌
-async function verifyToken(token: string): Promise<boolean> {
-    if (!token) return false;
+// 辅助函数：验证用户令牌并返回用户信息（用户名和角色）
+async function verifyToken(token: string): Promise<{ username: string, role: string } | null> {
+    if (!token) {
+        console.log("No token provided");
+        return null;
+    }
+    console.log(`Verifying token: ${token.substring(0, 5)}...`);
 
     try {
         const result = await dynamo.send(
@@ -49,10 +59,38 @@ async function verifyToken(token: string): Promise<boolean> {
                 ExpressionAttributeValues: { ":token": token },
             })
         );
-        return !!(result.Items && result.Items.length > 0);
+
+        if (result.Items && result.Items.length > 0) {
+            const user = result.Items[0];
+            console.log(`User found: ${user.username}, Role: ${user.role}`);
+            return {
+                username: user.username,
+                role: user.role || "viewer"
+            };
+        }
+        console.log("No user found for this token");
+        return null;
     } catch (error) {
         console.error("Token verification error:", error);
-        return false;
+        return null;
+    }
+}
+
+// 辅助函数：记录审计日志到 DynamoDB
+async function logAuditAction(username: string, action: string, details: string) {
+    try {
+        await dynamo.send(new PutCommand({
+            TableName: AUDIT_LOGS_TABLE,
+            Item: {
+                logId: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+                timestamp: Date.now(),
+                action,
+                username,
+                details
+            }
+        }));
+    } catch (error) {
+        console.error("Failed to log audit action:", error);
     }
 }
 
@@ -347,38 +385,35 @@ app.get("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId", async
     }
 });
 
-// 辅助函数：生成本地文件代理 URL
-function getProxyUrl(req: Request, key: string): string {
-    const host = req.get("host");
-    const protocol = req.protocol;
-    return `${protocol}://${host}/v1/files/${key}`;
+// 辅助函数：生成带 Token 的本地代理 URL
+function getAuthenticatedUrl(req: Request, key: string, token: string): string {
+    const protocol = req.headers["x-forwarded-proto"] || "https";
+    const host = req.headers.host;
+    return `${protocol}://${host}/v1/files/${key}?auth_token=${token}`;
 }
 
 // 获取上传 URL (Recipe)
 app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Request, res: Response) => {
     try {
         const token = extractAuth(req);
-        if (!(await verifyToken(token || ""))) {
+        const user = await verifyToken(token || "");
+        if (!user) {
             return res.status(401).json({ error: "Unauthorized" });
         }
+        if (user.role !== "admin" && user.role !== "developer") {
+            return res.status(403).json({ error: "Forbidden: Admin or Developer role required for uploads" });
+        }
 
-        const { name, version, user, channel } = req.params as { name: string; version: string; user: string; channel: string };
-        const packageId = getPackageId(name, version, user, channel);
+        const { name, version, user: c_user, channel } = req.params as { name: string; version: string; user: string; channel: string };
+        const packageId = getPackageId(name, version, c_user, channel);
 
-        // 支持多种格式：{files: [...]} 或 {filename: size, ...}
         const body = req.body || {};
         const files = Array.isArray(body.files) ? body.files : Object.keys(body).filter(k => typeof body[k] === 'number' || typeof body[k] === 'string');
 
-        if (files.length === 0 && body.files) {
-            // Handle case where body.files might be an object or something else
-        }
-
         const uploadUrls: Record<string, string> = {};
-
         for (const file of files) {
             const key = `${packageId}/${file}`;
-            // 不再使用 S3 预签名 URL，而是使用本地代理 URL
-            uploadUrls[file] = getProxyUrl(req, key);
+            uploadUrls[file] = getAuthenticatedUrl(req, key, token || "");
         }
 
         // 更新包元数据 (Recipe)
@@ -389,13 +424,16 @@ app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Req
                     packageId,
                     packageName: name,
                     version,
-                    user,
+                    user: c_user,
                     channel,
                     timestamp: Date.now(),
                     files,
                 },
             })
         );
+
+        // 记录审计日志
+        await logAuditAction(user.username, "UPLOAD_RECIPE", `Uploaded recipe for ${packageId}`);
 
         res.json(uploadUrls);
     } catch (error) {
@@ -408,18 +446,22 @@ app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Req
 app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload_urls", async (req: Request, res: Response) => {
     try {
         const token = extractAuth(req);
-        if (!(await verifyToken(token || ""))) {
+        const user = await verifyToken(token || "");
+        if (!user) {
             return res.status(401).json({ error: "Unauthorized" });
         }
+        if (user.role !== "admin" && user.role !== "developer") {
+            return res.status(403).json({ error: "Forbidden: Admin or Developer role required for uploads" });
+        }
 
-        const { name, version, user, channel, binPackageId } = req.params as {
+        const { name, version, user: c_user, channel, binPackageId } = req.params as {
             name: string;
             version: string;
             user: string;
             channel: string;
             binPackageId: string;
         };
-        const packageId = getPackageId(name, version, user, channel);
+        const packageId = getPackageId(name, version, c_user, channel);
 
         const body = req.body || {};
         const files = Array.isArray(body.files) ? body.files : Object.keys(body).filter(k => typeof body[k] === 'number' || typeof body[k] === 'string' || k !== 'packageId');
@@ -428,14 +470,13 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload
 
         for (const file of files) {
             const key = `${packageId}/package/${binPackageId}/${file}`;
-            // 使用本地代理 URL
-            uploadUrls[file] = getProxyUrl(req, key);
+            uploadUrls[file] = getAuthenticatedUrl(req, key, token || "");
         }
 
         // 更新包元数据，记录此二进制包存在及其配置
         try {
             const result = await dynamo.send(new GetCommand({ TableName: PACKAGES_TABLE, Key: { packageId } }));
-            const item = result.Item || { packageId, packageName: name, version, user, channel, packages: {} };
+            const item = result.Item || { packageId, packageName: name, version, user: c_user, channel, packages: {} };
             if (!item.packages) item.packages = {};
 
             // 存储该二进制包的配置信息，供 Conan 客户端匹配使用
@@ -448,6 +489,9 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload
                 TableName: PACKAGES_TABLE,
                 Item: item
             }));
+
+            // 记录审计日志
+            await logAuditAction(user.username, "UPLOAD_PACKAGE", `Uploaded binary package ${binPackageId} for ${packageId}`);
         } catch (e) {
             console.error("Update metadata error:", e);
         }
@@ -479,9 +523,12 @@ app.get("/v1/conans/:name/:version/:user/:channel/download_urls", async (req: Re
         const downloadUrls: Record<string, string> = {};
         const files = result.Item.files || [];
 
+        // 注意：下载也带上 token，确保权限校验一致
+        const token = extractAuth(req);
+
         for (const file of files) {
             const key = `${packageId}/${file}`;
-            downloadUrls[file] = getProxyUrl(req, key);
+            downloadUrls[file] = getAuthenticatedUrl(req, key, token || "");
         }
 
         res.json(downloadUrls);
@@ -507,9 +554,10 @@ app.get("/v1/conans/:name/:version/:user/:channel/packages/:packageId/download_u
         const files = ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"];
         const downloadUrls: Record<string, string> = {};
 
+        const token = extractAuth(req);
         for (const file of files) {
             const key = `${packageId}/package/${binPackageId}/${file}`;
-            downloadUrls[file] = getProxyUrl(req, key);
+            downloadUrls[file] = getAuthenticatedUrl(req, key, token || "");
         }
 
         res.json(downloadUrls);
@@ -522,79 +570,103 @@ app.get("/v1/conans/:name/:version/:user/:channel/packages/:packageId/download_u
 // 文件代理 - 下载 (GET)
 app.get("/v1/files/*", async (req: Request, res: Response) => {
     try {
-        // 从路径中提取文件 key（移除 /v1/files/ 前缀）
+        const token = extractAuth(req);
+        const user = await verifyToken(token || "");
+        if (!user) return res.status(401).json({ error: "Unauthorized" });
+
         const key = req.path.replace(/^\/v1\/files\//, "");
-
-        const command = new GetObjectCommand({
-            Bucket: PACKAGES_BUCKET,
-            Key: key,
-        });
-
+        const command = new GetObjectCommand({ Bucket: PACKAGES_BUCKET, Key: key });
         const result = await s3.send(command);
 
         if (result.Body) {
             res.setHeader("Content-Type", result.ContentType || "application/octet-stream");
-            // @ts-ignore - Body 可以是流
+            // @ts-ignore
             result.Body.pipe(res);
         } else {
-            res.status(404).json({ error: "File not found" });
+            res.status(404).send("File not found");
         }
-    } catch (error) {
-        console.error("File download error:", error);
-        res.status(404).json({ error: "File not found" });
+    } catch (e) {
+        res.status(404).send("File not found");
     }
 });
 
 // 文件代理 - 上传 (PUT)
 app.put("/v1/files/*", async (req: Request, res: Response) => {
     try {
+        const token = extractAuth(req);
+        const user = await verifyToken(token || "");
+
+        if (!user || (user.role !== "admin" && user.role !== "developer")) {
+            return res.status(403).json({ error: "Forbidden: Upload access denied" });
+        }
+
         const key = req.path.replace(/^\/v1\/files\//, "");
 
-        // 处理请求体：可能是 Buffer、String 或需要 base64 解码
+        // 转换 body 为 Buffer
         let body: Buffer;
         if (Buffer.isBuffer(req.body)) {
             body = req.body;
-        } else if (typeof req.body === "string") {
-            // 检查是否是 base64 编码的二进制数据
-            // 如果是有效的 base64，尝试解码
-            try {
-                const decoded = Buffer.from(req.body, "base64");
-                // 检查解码后是否看起来像 gzip (1f 8b)
-                if (decoded.length > 2 && decoded[0] === 0x1f && decoded[1] === 0x8b) {
-                    body = decoded;
-                } else {
-                    // 不是 gzip，可能是文本文件，直接使用
-                    body = Buffer.from(req.body);
-                }
-            } catch {
-                body = Buffer.from(req.body);
-            }
         } else {
-            body = Buffer.from(JSON.stringify(req.body));
+            body = Buffer.from(req.body);
         }
 
-        const command = new PutObjectCommand({
+        await s3.send(new PutObjectCommand({
             Bucket: PACKAGES_BUCKET,
             Key: key,
             Body: body,
             ContentType: req.headers["content-type"] as string || "application/octet-stream"
-        });
-
-        await s3.send(command);
-        res.status(200).send("OK");
+        }));
+        res.send("OK");
     } catch (error) {
         console.error("File upload error:", error);
-        res.status(500).json({ error: "Upload failed" });
+        res.status(500).send("Upload failed");
+    }
+});
+
+// 处理删除全包 (DELETE)
+app.delete("/v1/conans/:name/:version/:user/:channel", async (req: Request, res: Response) => {
+    try {
+        const token = extractAuth(req);
+        const user = await verifyToken(token || "");
+        if (user && user.role === "admin") {
+            const { name, version, user: c_user, channel } = req.params as Record<string, string>;
+            const packageId = getPackageId(name, version, c_user, channel);
+            await logAuditAction(user.username, "DELETE_PACKAGE", `Deleted package ${packageId}`);
+            res.json({ status: "ok" });
+        } else {
+            res.status(403).json({ error: "Forbidden: Admin required for deletion" });
+        }
+    } catch (e) {
+        res.status(500).json({ error: "Internal error" });
     }
 });
 
 // 删除包中的文件 (Conan 1.x 上传流程一部分)
 app.post("/v1/conans/:name/:version/:user/:channel/remove_files", async (req: Request, res: Response) => {
-    // 简化处理：对于我们的 Serverless 实现，通常覆盖上传，所以直接返回 OK
+    try {
+        const token = extractAuth(req);
+        const user = await verifyToken(token || "");
+        if (user && (user.role === "admin" || user.role === "developer")) {
+            const { name, version, user: c_user, channel } = req.params as Record<string, string>;
+            await logAuditAction(user.username, "REMOVE_FILES", `Removed recipe files for ${name}/${version}@${c_user}/${channel}`);
+        } else if (user) {
+            return res.status(403).json({ error: "Forbidden: Admin or Developer role required" });
+        }
+    } catch (e) { }
     res.json({ status: "ok" });
 });
 
 app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/remove_files", async (req: Request, res: Response) => {
+    try {
+        const token = extractAuth(req);
+        const user = await verifyToken(token || "");
+        if (user && (user.role === "admin" || user.role === "developer")) {
+            const { name, version, user: c_user, channel, binPackageId } = req.params as Record<string, string>;
+            await logAuditAction(user.username, "REMOVE_PACKAGE_FILES", `Removed binary files for ${name}/${version}@${c_user}/${channel} (Package: ${binPackageId})`);
+        } else if (user) {
+            return res.status(403).json({ error: "Forbidden: Admin or Developer role required" });
+        }
+    } catch (e) { }
     res.json({ status: "ok" });
 });
 

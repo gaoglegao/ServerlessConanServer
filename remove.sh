@@ -9,7 +9,13 @@ echo "=============================================="
 echo "🗑️  Serverless Conan Server 一键删除"
 echo "=============================================="
 
-REGION="ap-east-1"
+# 优先从 .env 加载配置
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
+fi
+
+REGION=${AWS_REGION:-"ap-east-1"}
+export AWS_PROFILE=${AWS_PROFILE:-"conanserver"}
 
 # 确认删除
 if [ "$1" != "-f" ]; then

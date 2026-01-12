@@ -62,15 +62,24 @@ else
     echo ""
     echo "🔧 步骤 3: 创建默认管理员用户..."
     
+    # 优先从 .env 加载配置
+    if [ -f .env ]; then
+        export $(grep -v '^#' .env | xargs)
+    fi
+
+    ADMIN_USER=${CONAN_ADMIN_USER:-"admin"}
+    ADMIN_PASS=${CONAN_ADMIN_PASS:-"admin123"}
+    
     # 使用 AWS CLI 直接创建用户
     ADMIN_TOKEN=$(openssl rand -hex 32)
-    PASSWORD_HASH=$(echo -n "admin123" | openssl dgst -sha256 | awk '{print $2}')
+    PASSWORD_HASH=$(echo -n "$ADMIN_PASS" | openssl dgst -sha256 | awk '{print $2}')
     
     aws dynamodb put-item \
         --table-name "$USERS_TABLE" \
         --item "{
-            \"username\": {\"S\": \"admin\"},
+            \"username\": {\"S\": \"$ADMIN_USER\"},
             \"passwordHash\": {\"S\": \"$PASSWORD_HASH\"},
+            \"role\": {\"S\": \"admin\"},
             \"token\": {\"S\": \"$ADMIN_TOKEN\"},
             \"createdAt\": {\"N\": \"$(date +%s)\"}
         }" \
@@ -84,12 +93,12 @@ else
     echo "📍 API 端点: $API_ENDPOINT"
     echo ""
     echo "👤 默认管理员账户:"
-    echo "   用户名: admin"
-    echo "   密码: admin123"
+    echo "   用户名: $ADMIN_USER"
+    echo "   密码: $ADMIN_PASS"
     echo ""
     echo "📝 配置 Conan 1.x 客户端:"
     echo "   conan remote add my-server $API_ENDPOINT"
-    echo "   conan user admin -p admin123 -r my-server"
+    echo "   conan user $ADMIN_USER -p <YOUR_PASSWORD> -r my-server"
     echo ""
     echo "📖 更多信息请参阅 README.md"
 fi

@@ -45,15 +45,36 @@ export function ConanServerStack({ stack }: StackContext) {
         },
     });
 
+    // DynamoDB 表用于存储审计日志
+    const auditLogsTable = new Table(stack, "ConanAuditLogs", {
+        fields: {
+            logId: "string",      // 唯一 ID
+            timestamp: "number",   // 时间戳
+            action: "string",     // 操作类型 (UPLOAD, DOWNLOAD, etc.)
+            username: "string",   // 执行用户
+            details: "string",    // 操作详情
+        },
+        primaryIndex: { partitionKey: "logId" },
+        globalIndexes: {
+            actionIndex: {
+                partitionKey: "action",
+                sortKey: "timestamp",
+            },
+        },
+    });
+
     // API Gateway + Lambda
     const api = new Api(stack, "ConanApi", {
         defaults: {
             function: {
-                bind: [packagesBucket, packagesTable, usersTable],
+                bind: [packagesBucket, packagesTable, usersTable, auditLogsTable],
+                // 限制 CloudWatch 日志保留时间为 1 天，降低历史数据成本
+                logRetention: "one_day",
                 environment: {
                     PACKAGES_BUCKET_NAME: packagesBucket.bucketName,
                     PACKAGES_TABLE_NAME: packagesTable.tableName,
                     USERS_TABLE_NAME: usersTable.tableName,
+                    AUDIT_LOGS_TABLE_NAME: auditLogsTable.tableName,
                 },
             },
         },
@@ -68,7 +89,9 @@ export function ConanServerStack({ stack }: StackContext) {
             // 包上传和下载
             "GET /v1/conans/{name}/{version}/{user}/{channel}/packages": "functions/api.handler",
             "POST /v1/conans/{name}/{version}/{user}/{channel}/upload_urls": "functions/api.handler",
+            "POST /v1/conans/{name}/{version}/{user}/{channel}/packages/{binPackageId}/upload_urls": "functions/api.handler",
             "GET /v1/conans/{name}/{version}/{user}/{channel}/download_urls": "functions/api.handler",
+            "GET /v1/conans/{name}/{version}/{user}/{channel}/packages/{packageId}/download_urls": "functions/api.handler",
 
             // 包文件操作
             "GET /v1/files/{key}": "functions/api.handler",
@@ -92,6 +115,7 @@ export function ConanServerStack({ stack }: StackContext) {
         PackagesBucketName: packagesBucket.bucketName,
         PackagesTableName: packagesTable.tableName,
         UsersTableName: usersTable.tableName,
+        AuditLogsTableName: auditLogsTable.tableName,
     });
 
     return {
@@ -99,5 +123,6 @@ export function ConanServerStack({ stack }: StackContext) {
         packagesBucket,
         packagesTable,
         usersTable,
+        auditLogsTable,
     };
 }
