@@ -202,8 +202,9 @@ app.post("/v1/users/authenticate", async (req: Request, res: Response) => {
         );
 
         const user = result.Item;
+        const passwordHash = crypto.createHash("sha256").update(password).digest("hex");
 
-        if (user && user.password === password) {
+        if (user && user.passwordHash === passwordHash) {
             const token = crypto.randomBytes(32).toString("hex");
             await dynamo.send(
                 new PutCommand({
