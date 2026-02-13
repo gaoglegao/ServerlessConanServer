@@ -7,10 +7,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import crypto from "crypto";
 
 const app = express();
-app.use(express.json());
-app.use(express.text());
-// 处理二进制文件上传（如 .tgz 文件）
-app.use(express.raw({ type: ["application/octet-stream", "application/gzip", "application/x-gzip", "application/x-tar", "*/*"], limit: "50mb" }));
+
 
 // AWS 客户端初始化
 const s3 = new S3Client({});
@@ -21,6 +18,7 @@ const PACKAGES_BUCKET = process.env.PACKAGES_BUCKET_NAME!;
 const PACKAGES_TABLE = process.env.PACKAGES_TABLE_NAME!;
 const USERS_TABLE = process.env.USERS_TABLE_NAME!;
 const AUDIT_LOGS_TABLE = process.env.AUDIT_LOGS_TABLE_NAME!;
+const CLOUDFRONT_DOMAIN = process.env.CLOUDFRONT_DOMAIN;
 
 // 辅助函数：生成包的唯一 ID
 function getPackageId(name: string, version: string, user: string, channel: string): string {
@@ -94,7 +92,52 @@ async function logAuditAction(username: string, action: string, details: string)
     }
 }
 
+
 // ============ API 路由 ============
+
+// 核心修复：重定向端点 (定义在 Body Parser 之前，避免大文件缓冲导致连接超时)
+// 作用：接收客户端带着 Auth Header 的请求，验证后 307 重定向到 S3 预签名 URL。
+app.all("/v1/files/redirect/*", async (req: Request, res: Response) => {
+    try {
+        const token = extractAuth(req);
+        const user = await verifyToken(token || "");
+
+        // 鉴权失败
+        if (!user) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+
+        const key = req.path.replace(/^\/v1\/files\/redirect\//, "");
+
+        // 根据请求方法生成对应的 S3 预签名 URL
+        let presignedUrl: string;
+        if (req.method === "PUT") {
+            // 上传鉴权：需要 admin 或 developer 权限
+            if (user.role !== "admin" && user.role !== "developer") {
+                return res.status(403).json({ error: "Forbidden: Upload access denied" });
+            }
+            presignedUrl = await getPresignedUploadUrl(PACKAGES_BUCKET, key);
+        } else if (req.method === "GET" || req.method === "HEAD") {
+            // 下载鉴权：读权限 (verifyToken 已通过)
+            presignedUrl = await getPresignedDownloadUrl(PACKAGES_BUCKET, key);
+        } else {
+            return res.status(405).json({ error: "Method not allowed" });
+        }
+
+        // 使用 307 Temporary Redirect 保持 HTTP 方法 (PUT 仍是 PUT)
+        // Express/Node 默认不会在 redirect 时去读 body，所以这会立即返回
+        res.redirect(307, presignedUrl);
+    } catch (error) {
+        console.error("Redirect handler error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+// 全局中间件：Body Parsers (位置重要：必须在 redirect 路由之后)
+app.use(express.json());
+app.use(express.text());
+// 处理二进制文件上传（如 .tgz 文件），限制提高到 200MB 兼容残留的代理请求
+app.use(express.raw({ type: ["application/octet-stream", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-tgz", "*/*"], limit: "200mb" }));
 
 // Ping 端点
 app.get("/v1/ping", (_req: Request, res: Response) => {
@@ -239,7 +282,7 @@ app.all("/v1/users/check_credentials", async (req: Request, res: Response) => {
 });
 
 // 搜索包
-app.get("/v1/conans/search", async (req: Request, res: Response) => {
+const searchHandler = async (req: Request, res: Response) => {
     try {
         const pattern = (req.query.q as string) || "*";
 
@@ -265,7 +308,13 @@ app.get("/v1/conans/search", async (req: Request, res: Response) => {
         console.error("Search error:", error);
         res.status(500).json({ error: "Internal server error" });
     }
-});
+};
+
+app.get("/v1/conans/search", searchHandler);
+// 兼容 Conan v2 搜索
+app.get("/v2/conans/search", searchHandler);
+// 兼容可能的根路径搜索请求
+app.get("/search", searchHandler);
 
 // 获取包信息
 app.get("/v1/conans/:name/:version/:user/:channel", async (req: Request, res: Response) => {
@@ -386,12 +435,32 @@ app.get("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId", async
     }
 });
 
-// 辅助函数：生成带 Token 的本地代理 URL
-function getAuthenticatedUrl(req: Request, key: string, token: string): string {
-    const protocol = req.headers["x-forwarded-proto"] || "https";
-    const host = req.headers.host;
-    return `${protocol}://${host}/v1/files/${key}?auth_token=${token}`;
+// 辅助函数：生成预签名 Upload URL (PUT)
+async function getPresignedUploadUrl(bucket: string, key: string): Promise<string> {
+    const command = new PutObjectCommand({ Bucket: bucket, Key: key });
+    const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
+    if (CLOUDFRONT_DOMAIN) {
+        // 使用 CloudFront 域名替换 S3 域名
+        // 这样客户端发送请求到 CloudFront，CloudFront 会剥离 Auth Header 再转发给 S3
+        // S3 只验证签名（签名是针对 S3 原始域名的，但只要 Host Header 被 CloudFront 还原为 S3 域名，验证通过）
+        return signedUrl.replace(/https:\/\/[^/]+/, `https://${CLOUDFRONT_DOMAIN}`);
+    }
+    return signedUrl;
 }
+
+// 辅助函数：生成预签名 Download URL (GET)
+async function getPresignedDownloadUrl(bucket: string, key: string): Promise<string> {
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
+    if (CLOUDFRONT_DOMAIN) {
+        return signedUrl.replace(/https:\/\/[^/]+/, `https://${CLOUDFRONT_DOMAIN}`);
+    }
+    return signedUrl;
+}
+
+
+
+
 
 // 获取上传 URL (Recipe)
 app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Request, res: Response) => {
@@ -412,9 +481,10 @@ app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Req
         const files = Array.isArray(body.files) ? body.files : Object.keys(body).filter(k => typeof body[k] === 'number' || typeof body[k] === 'string');
 
         const uploadUrls: Record<string, string> = {};
+
         for (const file of files) {
             const key = `${packageId}/${file}`;
-            uploadUrls[file] = getAuthenticatedUrl(req, key, token || "");
+            uploadUrls[file] = await getPresignedUploadUrl(PACKAGES_BUCKET, key);
         }
 
         // 更新包元数据 (Recipe)
@@ -471,7 +541,7 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload
 
         for (const file of files) {
             const key = `${packageId}/package/${binPackageId}/${file}`;
-            uploadUrls[file] = getAuthenticatedUrl(req, key, token || "");
+            uploadUrls[file] = await getPresignedUploadUrl(PACKAGES_BUCKET, key);
         }
 
         // 更新包元数据，记录此二进制包存在及其配置
@@ -524,12 +594,9 @@ app.get("/v1/conans/:name/:version/:user/:channel/download_urls", async (req: Re
         const downloadUrls: Record<string, string> = {};
         const files = result.Item.files || [];
 
-        // 注意：下载也带上 token，确保权限校验一致
-        const token = extractAuth(req);
-
         for (const file of files) {
             const key = `${packageId}/${file}`;
-            downloadUrls[file] = getAuthenticatedUrl(req, key, token || "");
+            downloadUrls[file] = await getPresignedDownloadUrl(PACKAGES_BUCKET, key);
         }
 
         res.json(downloadUrls);
@@ -555,10 +622,9 @@ app.get("/v1/conans/:name/:version/:user/:channel/packages/:packageId/download_u
         const files = ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"];
         const downloadUrls: Record<string, string> = {};
 
-        const token = extractAuth(req);
         for (const file of files) {
             const key = `${packageId}/package/${binPackageId}/${file}`;
-            downloadUrls[file] = getAuthenticatedUrl(req, key, token || "");
+            downloadUrls[file] = await getPresignedDownloadUrl(PACKAGES_BUCKET, key);
         }
 
         res.json(downloadUrls);

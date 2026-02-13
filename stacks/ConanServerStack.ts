@@ -1,4 +1,6 @@
 import { StackContext, Api, Bucket, Table } from "sst/constructs";
+import * as cf from "aws-cdk-lib/aws-cloudfront";
+import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 
 export function ConanServerStack({ stack }: StackContext) {
     // S3 存储桶用于存储 Conan 包文件
@@ -63,6 +65,43 @@ export function ConanServerStack({ stack }: StackContext) {
         },
     });
 
+    // 使用 CloudFront Function 强制剥离 Authorization Header
+    // 即使 OriginRequestPolicy 配置不转发，有时 Viewer 请求的 Header 仍可能通过 certain configurations 泄露或冲突
+    // 显式删除是最稳妥的
+    const stripAuthFunction = new cf.Function(stack, "StripAuthFunction", {
+        code: cf.FunctionCode.fromInline(`
+            function handler(event) {
+                var request = event.request;
+                if (request.headers.authorization) {
+                    delete request.headers.authorization;
+                }
+                return request;
+            }
+        `),
+    });
+
+    // CloudFront Distribution (用于剥离 Authorization Header 并允许超大文件通过 S3 预签名直传)
+    const distribution = new cf.Distribution(stack, "ConanDist", {
+        defaultBehavior: {
+            // 使用 HttpOrigin 而非 S3Origin，避免 CloudFront 自动添加 OAI/OAC 导致 S3 报错 "Only one auth mechanism allowed"
+            // 我们完全依赖 Presigned URL 进行鉴权
+            origin: new origins.HttpOrigin(packagesBucket.cdk.bucket.bucketRegionalDomainName),
+            allowedMethods: cf.AllowedMethods.ALLOW_ALL,
+            cachePolicy: cf.CachePolicy.CACHING_DISABLED,
+            originRequestPolicy: new cf.OriginRequestPolicy(stack, "ConanOriginParamPolicy", {
+                queryStringBehavior: cf.OriginRequestQueryStringBehavior.all(),
+                // 关键配置：不转发 Header (特别是 Authorization)，避免 S3 鉴权冲突
+                headerBehavior: cf.OriginRequestHeaderBehavior.none(),
+                cookieBehavior: cf.OriginRequestCookieBehavior.none(),
+            }),
+            viewerProtocolPolicy: cf.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+            functionAssociations: [{
+                function: stripAuthFunction,
+                eventType: cf.FunctionEventType.VIEWER_REQUEST,
+            }],
+        },
+    });
+
     // API Gateway + Lambda
     const api = new Api(stack, "ConanApi", {
         defaults: {
@@ -75,6 +114,7 @@ export function ConanServerStack({ stack }: StackContext) {
                     PACKAGES_TABLE_NAME: packagesTable.tableName,
                     USERS_TABLE_NAME: usersTable.tableName,
                     AUDIT_LOGS_TABLE_NAME: auditLogsTable.tableName,
+                    CLOUDFRONT_DOMAIN: distribution.domainName,
                 },
             },
         },
@@ -84,6 +124,8 @@ export function ConanServerStack({ stack }: StackContext) {
 
             // 包搜索和列表
             "GET /v1/conans/search": "functions/api.handler",
+            "GET /v2/conans/search": "functions/api.handler",
+            "GET /search": "functions/api.handler",
             "GET /v1/conans/{name}/{version}/{user}/{channel}": "functions/api.handler",
 
             // 包上传和下载
@@ -93,7 +135,8 @@ export function ConanServerStack({ stack }: StackContext) {
             "GET /v1/conans/{name}/{version}/{user}/{channel}/download_urls": "functions/api.handler",
             "GET /v1/conans/{name}/{version}/{user}/{channel}/packages/{packageId}/download_urls": "functions/api.handler",
 
-            // 包文件操作
+            // 包文件操作 (Proxy & Redirect)
+            "ANY /v1/files/redirect/{proxy+}": "functions/api.handler",
             "GET /v1/files/{key}": "functions/api.handler",
             "PUT /v1/files/{key}": "functions/api.handler",
 
