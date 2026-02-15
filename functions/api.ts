@@ -93,6 +93,41 @@ async function logAuditAction(username: string, action: string, details: string)
 }
 
 
+async function getFileSnapshot(packageId: string, binPackageId?: string): Promise<Record<string, string>> {
+    const key = binPackageId
+        ? `${packageId}/package/${binPackageId}/conanmanifest.txt`
+        : `${packageId}/conanmanifest.txt`;
+
+    try {
+        const s3Result = await s3.send(new GetObjectCommand({
+            Bucket: PACKAGES_BUCKET,
+            Key: key
+        }));
+        if (s3Result.Body) {
+            const content = await s3Result.Body.transformToString();
+            const lines = content.trim().split('\n');
+            const snapshot: Record<string, string> = {};
+            for (let i = 1; i < lines.length; i++) {
+                const parts = lines[i].split(': ');
+                if (parts.length >= 2) {
+                    snapshot[parts[0].trim()] = parts[1].trim();
+                }
+            }
+            // 补充自身 manifest
+            if (!snapshot["conanmanifest.txt"]) snapshot["conanmanifest.txt"] = "0";
+            return snapshot;
+        }
+    } catch (e) {
+        // console.error(`Snapshot read fail for ${key}`);
+    }
+    // 默认兜底
+    return binPackageId
+        ? { "conan_package.tgz": "0", "conaninfo.txt": "0", "conanmanifest.txt": "0" }
+        : { "conanfile.py": "0", "conanmanifest.txt": "0" };
+}
+
+
+
 // ============ API 路由 ============
 
 // 核心修复：重定向端点 (定义在 Body Parser 之前，避免大文件缓冲导致连接超时)
@@ -139,16 +174,18 @@ app.use(express.text());
 // 处理二进制文件上传（如 .tgz 文件），限制提高到 200MB 兼容残留的代理请求
 app.use(express.raw({ type: ["application/octet-stream", "application/gzip", "application/x-gzip", "application/x-tar", "application/x-tgz", "*/*"], limit: "200mb" }));
 
+app.use((_req, res, next) => {
+    // 明确声明支持 revisions
+    res.setHeader("X-Conan-Server-Capabilities", "revisions");
+    next();
+});
+
 // Ping 端点
+
 app.get("/v1/ping", (_req: Request, res: Response) => {
     res.json({ status: "ok", version: "1.0.0" });
 });
 
-// 添加 Conan 服务器标识头
-app.use((_req, res, next) => {
-    res.setHeader("X-Conan-Server-Capabilities", "checksum_deploy");
-    next();
-});
 
 app.get("/v2/ping", (_req: Request, res: Response) => {
     res.json({ status: "ok", version: "2.0.0" });
@@ -296,10 +333,16 @@ const searchHandler = async (req: Request, res: Response) => {
         const packages = result.Items || [];
 
         // 简单的模式匹配
-        const filtered =
-            pattern === "*"
-                ? packages
-                : packages.filter((pkg) => pkg.packageName.includes(pattern.replace(/\*/g, "")));
+        const filtered = packages.filter((pkg) => {
+            if (pattern === "*") return true;
+            const purePattern = pattern.replace(/\*/g, "");
+            // 无论是包名包含模式，还是模式包含包名（全路径匹配），或者是 packageId 匹配
+            return pkg.packageName.includes(purePattern) ||
+                purePattern.includes(pkg.packageName) ||
+                pkg.packageId === pattern;
+        });
+
+
 
         const results = filtered.map((pkg) => pkg.packageId);
 
@@ -311,13 +354,111 @@ const searchHandler = async (req: Request, res: Response) => {
 };
 
 app.get("/v1/conans/search", searchHandler);
-// 兼容 Conan v2 搜索
+// 兼容 Conan v2 搜索 (Conan 2.x 请求 /v2/conans)
+app.get("/v2/conans", searchHandler);
 app.get("/v2/conans/search", searchHandler);
 // 兼容可能的根路径搜索请求
 app.get("/search", searchHandler);
 
+// 搜索二进制包 (Conan 1.x & 2.x)
+const binarySearchHandler = async (req: Request, res: Response) => {
+    try {
+        const { name, version, user, channel } = req.params as { name: string; version: string; user: string; channel: string };
+        const packageId = getPackageId(name, version, user, channel);
+
+        const result = await dynamo.send(
+            new GetCommand({
+                TableName: PACKAGES_TABLE,
+                Key: { packageId },
+            })
+        );
+
+        if (result.Item && result.Item.packages) {
+            // Conan 1.x /search 会返回 { package_id: { settings, options } }
+            // 而 Conan 2.x 期望格式可能不同，但通常返回这个字典也能工作
+            res.json(result.Item.packages);
+        } else {
+            res.json({});
+        }
+    } catch (error) {
+        console.error("Binary search error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
+};
+
+// --- Conan Discovery & Metadata (V1 & V2) ---
+
+// 1. 最新修订版 (Latest Revision) - 优先级最高，避免被基础包路径截获
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/latest",
+    "/v1/conans/:name/:version/:user/:channel/revisions/latest",
+    "/v2/conans/:name/:version/:user/:channel/latest",
+    "/v2/conans/:name/:version/:user/:channel/revisions/latest"
+], (req, res) => {
+    res.json({
+        revision: "0",
+        time: Math.floor(Date.now() / 1000)
+    });
+});
+
+// 2. 二进制包最新修订版
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/latest",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/latest",
+    "/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/revisions/latest",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/latest",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/latest"
+], (req, res) => {
+    res.json({
+        revision: "0",
+        time: Math.floor(Date.now() / 1000)
+    });
+});
+
+
+// 3. 修订版列表 (Revisions List)
+const getDynamicNow = () => Math.floor(Date.now() / 1000);
+
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/revisions",
+    "/v2/conans/:name/:version/:user/:channel/revisions"
+], (req, res) => {
+    res.json({
+        revisions: [{ revision: "0", time: Math.floor(Date.now() / 1000) }]
+    });
+});
+
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/revisions",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions"
+], (req, res) => {
+    res.json({
+        revisions: [{ revision: "0", time: Math.floor(Date.now() / 1000) }]
+    });
+});
+
+
+
+
+// 4. 二进制包搜索 (Search Binary Packages)
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/search",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/search",
+    "/v2/conans/:name/:version/:user/:channel/search",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/search"
+], binarySearchHandler);
+
+
+
 // 获取包信息
-app.get("/v1/conans/:name/:version/:user/:channel", async (req: Request, res: Response) => {
+app.get([
+    "/v1/conans/:name/:version/:user/:channel",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev",
+    "/v2/conans/:name/:version/:user/:channel",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev"
+], async (req: Request, res: Response) => {
+
     try {
         const { name, version, user, channel } = req.params as { name: string; version: string; user: string; channel: string };
         const packageId = getPackageId(name, version, user, channel);
@@ -340,8 +481,51 @@ app.get("/v1/conans/:name/:version/:user/:channel", async (req: Request, res: Re
     }
 });
 
+// 获取修订版下的文件列表 (V2 核心接口)
+app.get([
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/files",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/files"
+], async (req: Request, res: Response) => {
+    try {
+        const { name, version, user, channel } = req.params as { name: string; version: string; user: string; channel: string };
+        const packageId = getPackageId(name, version, user, channel);
+        const result = await dynamo.send(new GetCommand({ TableName: PACKAGES_TABLE, Key: { packageId } }));
+
+        if (result.Item) {
+            const snapshot = await getFileSnapshot(packageId);
+            res.json({ files: snapshot });
+        } else {
+            res.status(404).json({ error: "Recipe not found" });
+        }
+    } catch (e) {
+        res.status(500).json({ error: "Internal error" });
+    }
+});
+
+// 获取二进制包修订版下的文件列表
+app.get([
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/:prev/files"
+], async (req: Request, res: Response) => {
+    const { name, version, user, channel, binPackageId } = req.params as Record<string, string>;
+    const packageId = getPackageId(name, version, user, channel);
+    const snapshot = await getFileSnapshot(packageId, binPackageId);
+    res.json({ files: snapshot });
+});
+
+
+
+// 获取包的二进制包列表 (已经定义在上面了，这里保持逻辑一致)
+
+
+
+
 // 获取包的二进制包列表
-app.get("/v1/conans/:name/:version/:user/:channel/packages", async (req: Request, res: Response) => {
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/packages",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages",
+    "/v2/conans/:name/:version/:user/:channel/packages",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages"
+], async (req: Request, res: Response) => {
     try {
         const { name, version, user, channel } = req.params as { name: string; version: string; user: string; channel: string };
         const packageId = getPackageId(name, version, user, channel);
@@ -364,78 +548,29 @@ app.get("/v1/conans/:name/:version/:user/:channel/packages", async (req: Request
     }
 });
 
+
 // 获取单个二进制包的 snapshot（文件哈希映射）
-// Conan 1.x 的 package_snapshot 接口，返回 {filename: md5hash} 格式
-app.get("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId", async (req: Request, res: Response) => {
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/packages/:binPackageId",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/:prev",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/:prev"
+], async (req: Request, res: Response) => {
     try {
-        const { name, version, user, channel, binPackageId } = req.params as {
-            name: string;
-            version: string;
-            user: string;
-            channel: string;
-            binPackageId: string;
-        };
+        const { name, version, user, channel, binPackageId } = req.params as Record<string, string>;
         const packageId = getPackageId(name, version, user, channel);
 
-        const result = await dynamo.send(
-            new GetCommand({
-                TableName: PACKAGES_TABLE,
-                Key: { packageId },
-            })
-        );
-
+        const result = await dynamo.send(new GetCommand({ TableName: PACKAGES_TABLE, Key: { packageId } }));
         if (result.Item && result.Item.packages && result.Item.packages[binPackageId]) {
-            // 从 S3 读取 conanmanifest.txt 并解析哈希
-            const manifestKey = `${packageId}/package/${binPackageId}/conanmanifest.txt`;
-            try {
-                const s3Result = await s3.send(new GetObjectCommand({
-                    Bucket: PACKAGES_BUCKET,
-                    Key: manifestKey
-                }));
-
-                if (s3Result.Body) {
-                    const content = await s3Result.Body.transformToString();
-                    // conanmanifest.txt 格式: 第一行是时间戳，后面是 filename: hash
-                    const lines = content.trim().split('\n');
-                    const snapshot: Record<string, string> = {};
-
-                    for (let i = 1; i < lines.length; i++) {
-                        const parts = lines[i].split(': ');
-                        if (parts.length >= 2) {
-                            snapshot[parts[0].trim()] = parts[1].trim();
-                        }
-                    }
-
-                    // Conan 要求 snapshot 必须包含 conaninfo, conanmanifest, conan_package 这三个关键字
-                    // conanmanifest.txt 自身不在 manifest 内容中，需要额外添加
-                    // 使用占位符哈希，因为客户端主要是检查文件是否存在
-                    if (!snapshot["conanmanifest.txt"]) {
-                        snapshot["conanmanifest.txt"] = "0";
-                    }
-                    if (!snapshot["conan_package.tgz"]) {
-                        snapshot["conan_package.tgz"] = "0";
-                    }
-
-                    res.json(snapshot);
-                } else {
-                    // 如果没有 manifest，返回空对象表示包存在但无法验证
-                    res.json({});
-                }
-            } catch (e) {
-                console.error("Error reading conanmanifest.txt:", e);
-                // 如果读取失败，返回空 snapshot
-                res.json({});
-            }
+            const snapshot = await getFileSnapshot(packageId, binPackageId);
+            res.json(snapshot);
         } else {
             res.status(404).json({ error: "Binary package not found" });
         }
-    } catch (error) {
-        console.error("Get binary package snapshot error:", error);
-        res.status(500).json({ error: "Internal server error" });
+    } catch (e) {
+        res.status(500).json({ error: "Internal error" });
     }
 });
 
-// 辅助函数：生成预签名 Upload URL (PUT)
 async function getPresignedUploadUrl(bucket: string, key: string): Promise<string> {
     const command = new PutObjectCommand({ Bucket: bucket, Key: key });
     const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
@@ -463,7 +598,11 @@ async function getPresignedDownloadUrl(bucket: string, key: string): Promise<str
 
 
 // 获取上传 URL (Recipe)
-app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Request, res: Response) => {
+app.post([
+    "/v1/conans/:name/:version/:user/:channel/upload_urls",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/upload_urls",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/upload_urls"
+], async (req: Request, res: Response) => {
     try {
         const token = extractAuth(req);
         const user = await verifyToken(token || "");
@@ -487,21 +626,28 @@ app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Req
             uploadUrls[file] = await getPresignedUploadUrl(PACKAGES_BUCKET, key);
         }
 
-        // 更新包元数据 (Recipe)
+        // 更新包元数据 (Recipe) - Read-Modify-Write 以保留 packages 字段
+        const getParams = { TableName: PACKAGES_TABLE, Key: { packageId } };
+        const oldItem = await dynamo.send(new GetCommand(getParams));
+        const newItem = {
+            ...(oldItem.Item || {}),
+            packageId,
+            packageName: name,
+            version,
+            user: c_user,
+            channel,
+            timestamp: Date.now(),
+            files,
+            packages: oldItem.Item?.packages || {}
+        };
+
         await dynamo.send(
             new PutCommand({
                 TableName: PACKAGES_TABLE,
-                Item: {
-                    packageId,
-                    packageName: name,
-                    version,
-                    user: c_user,
-                    channel,
-                    timestamp: Date.now(),
-                    files,
-                },
+                Item: newItem,
             })
         );
+
 
         // 记录审计日志
         await logAuditAction(user.username, "UPLOAD_RECIPE", `Uploaded recipe for ${packageId}`);
@@ -513,8 +659,13 @@ app.post("/v1/conans/:name/:version/:user/:channel/upload_urls", async (req: Req
     }
 });
 
+
 // 获取二进制包上传 URL
-app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload_urls", async (req: Request, res: Response) => {
+app.post([
+    "/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload_urls",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/:prev/upload_urls",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/:prev/upload_urls"
+], async (req: Request, res: Response) => {
     try {
         const token = extractAuth(req);
         const user = await verifyToken(token || "");
@@ -534,6 +685,7 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload
         };
         const packageId = getPackageId(name, version, c_user, channel);
 
+
         const body = req.body || {};
         const files = Array.isArray(body.files) ? body.files : Object.keys(body).filter(k => typeof body[k] === 'number' || typeof body[k] === 'string' || k !== 'packageId');
 
@@ -544,17 +696,40 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload
             uploadUrls[file] = await getPresignedUploadUrl(PACKAGES_BUCKET, key);
         }
 
-        // 更新包元数据，记录此二进制包存在及其配置
+        // 更新包元数据 - 确保写入 packages 索引
         try {
+            console.log(`Registering binary package: ${binPackageId} for recipe ${packageId}`);
+
+            // 重新读取最新状态，防止并发覆盖
             const result = await dynamo.send(new GetCommand({ TableName: PACKAGES_TABLE, Key: { packageId } }));
-            const item = result.Item || { packageId, packageName: name, version, user: c_user, channel, packages: {} };
+
+            // 如果 Recipe 不存在，则初始化一个
+            const item = result.Item || {
+                packageId,
+                packageName: name,
+                version,
+                user: c_user,
+                channel,
+                packages: {},
+                files: []
+            };
+
             if (!item.packages) item.packages = {};
 
-            // 存储该二进制包的配置信息，供 Conan 客户端匹配使用
-            item.packages[binPackageId] = {
-                settings: body.settings || {},
-                options: body.options || {}
-            };
+            // 标记该二进制包存在
+            // 注意：upload_urls 阶段请求体通常不包含 settings/options，只有文件列表
+            // 这里我们先占位，确保 search 接口能查到它
+            if (!item.packages[binPackageId]) {
+                item.packages[binPackageId] = {
+                    settings: {},
+                    options: {}
+                };
+            }
+            // 如果 body 里恰好有元数据（非标准但可能），则更新
+            if (body.settings) item.packages[binPackageId].settings = body.settings;
+            if (body.options) item.packages[binPackageId].options = body.options;
+
+            console.log(`Writing item to DynamoDB: `, JSON.stringify(item.packages[binPackageId]));
 
             await dynamo.send(new PutCommand({
                 TableName: PACKAGES_TABLE,
@@ -564,7 +739,7 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload
             // 记录审计日志
             await logAuditAction(user.username, "UPLOAD_PACKAGE", `Uploaded binary package ${binPackageId} for ${packageId}`);
         } catch (e) {
-            console.error("Update metadata error:", e);
+            console.error("Update binary metadata error:", e);
         }
 
         res.json(uploadUrls);
@@ -574,65 +749,55 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/upload
     }
 });
 
-// 获取下载 URL
-app.get("/v1/conans/:name/:version/:user/:channel/download_urls", async (req: Request, res: Response) => {
+// 获取下载 URL (V1/V2 通用处理器)
+const downloadUrlsHandler = async (req: Request, res: Response) => {
     try {
-        const { name, version, user, channel } = req.params as { name: string; version: string; user: string; channel: string };
-        const packageId = getPackageId(name, version, user, channel);
+        const { name, version, user, channel, packageId: binUriId, binPackageId: binParamId, filename } = req.params as Record<string, string>;
+        const binPkgId = binUriId || binParamId; // 兼容不同路由下的参数名
+        const recipeId = getPackageId(name, version, user, channel);
 
-        const result = await dynamo.send(
-            new GetCommand({
-                TableName: PACKAGES_TABLE,
-                Key: { packageId },
-            })
-        );
+        console.log(`DownloadUrls request: ${req.path}, recipeId=${recipeId}, binPkgId=${binPkgId}, filename=${filename}`);
 
-        if (!result.Item) {
-            return res.status(404).json({ error: "Package not found" });
+        const result = await dynamo.send(new GetCommand({ TableName: PACKAGES_TABLE, Key: { packageId: recipeId } }));
+        if (!result.Item) return res.status(404).json({ error: "Package not found" });
+
+        // 如果是特定文件请求 (V2 style: .../files/:filename)
+        // 重要：必须重定向，否则 Conan 会把本 JSON 当做文件内容保存
+        if (filename) {
+            let s3Path = binPkgId ? `${recipeId}/package/${binPkgId}/${filename}` : `${recipeId}/${filename}`;
+            const downloadUrl = await getPresignedDownloadUrl(PACKAGES_BUCKET, s3Path);
+            console.log(`Redirecting V2 file request to S3: ${s3Path}`);
+            return res.redirect(302, downloadUrl);
         }
 
-        const downloadUrls: Record<string, string> = {};
-        const files = result.Item.files || [];
-
+        // 默认返回所有文件的 download_urls (V1 style)
+        const files = binPkgId ? ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"] : (result.Item.files || ["conanfile.py", "conanmanifest.txt"]);
+        const urls: Record<string, string> = {};
         for (const file of files) {
-            const key = `${packageId}/${file}`;
-            downloadUrls[file] = await getPresignedDownloadUrl(PACKAGES_BUCKET, key);
+            let s3Path = binPkgId ? `${recipeId}/package/${binPkgId}/${file}` : `${recipeId}/${file}`;
+            urls[file] = await getPresignedDownloadUrl(PACKAGES_BUCKET, s3Path);
         }
-
-        res.json(downloadUrls);
-    } catch (error) {
-        console.error("Download URLs error:", error);
-        res.status(500).json({ error: "Internal server error" });
+        res.json(urls);
+    } catch (e) {
+        console.error("Download URL Handler error:", e);
+        res.status(500).json({ error: "Internal error" });
     }
-});
+};
 
-// 获取二进制包下载 URL
-app.get("/v1/conans/:name/:version/:user/:channel/packages/:packageId/download_urls", async (req: Request, res: Response) => {
-    try {
-        const { name, version, user, channel, packageId: binPackageId } = req.params as {
-            name: string;
-            version: string;
-            user: string;
-            channel: string;
-            packageId: string;
-        };
-        const packageId = getPackageId(name, version, user, channel);
-
-        // 我们这里假定二进制包包含固定的几个文件：conan_package.tgz, conaninfo.txt, conanmanifest.txt
-        const files = ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"];
-        const downloadUrls: Record<string, string> = {};
-
-        for (const file of files) {
-            const key = `${packageId}/package/${binPackageId}/${file}`;
-            downloadUrls[file] = await getPresignedDownloadUrl(PACKAGES_BUCKET, key);
-        }
-
-        res.json(downloadUrls);
-    } catch (error) {
-        console.error("Package Download URLs error:", error);
-        res.status(500).json({ error: "Internal server error" });
-    }
-});
+app.get([
+    // V1 Recipe
+    "/v1/conans/:name/:version/:user/:channel/download_urls",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/download_urls",
+    // V1 Package
+    "/v1/conans/:name/:version/:user/:channel/packages/:packageId/download_urls",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:packageId/revisions/:prev/download_urls",
+    // V2 Recipe
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/download_urls",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/files/:filename",
+    // V2 Package
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:packageId/revisions/:prev/download_urls",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:packageId/revisions/:prev/files/:filename"
+], downloadUrlsHandler);
 
 // 文件代理 - 下载 (GET)
 app.get("/v1/files/*", async (req: Request, res: Response) => {
@@ -691,7 +856,11 @@ app.put("/v1/files/*", async (req: Request, res: Response) => {
 });
 
 // 处理删除全包 (DELETE)
-app.delete("/v1/conans/:name/:version/:user/:channel", async (req: Request, res: Response) => {
+app.delete([
+    "/v1/conans/:name/:version/:user/:channel",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev"
+], async (req: Request, res: Response) => {
     try {
         const token = extractAuth(req);
         const user = await verifyToken(token || "");
@@ -708,8 +877,13 @@ app.delete("/v1/conans/:name/:version/:user/:channel", async (req: Request, res:
     }
 });
 
+
 // 删除包中的文件 (Conan 1.x 上传流程一部分)
-app.post("/v1/conans/:name/:version/:user/:channel/remove_files", async (req: Request, res: Response) => {
+app.post([
+    "/v1/conans/:name/:version/:user/:channel/remove_files",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/remove_files",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/remove_files"
+], async (req: Request, res: Response) => {
     try {
         const token = extractAuth(req);
         const user = await verifyToken(token || "");
@@ -723,7 +897,12 @@ app.post("/v1/conans/:name/:version/:user/:channel/remove_files", async (req: Re
     res.json({ status: "ok" });
 });
 
-app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/remove_files", async (req: Request, res: Response) => {
+
+app.post([
+    "/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/remove_files",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/:prev/remove_files",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/packages/:binPackageId/revisions/:prev/remove_files"
+], async (req: Request, res: Response) => {
     try {
         const token = extractAuth(req);
         const user = await verifyToken(token || "");
@@ -737,12 +916,32 @@ app.post("/v1/conans/:name/:version/:user/:channel/packages/:binPackageId/remove
     res.json({ status: "ok" });
 });
 
+
 // 获取包的 digest（用于检查更新）
-// Conan 1.x 上传时会调用此接口
-app.get("/v1/conans/:name/:version/:user/:channel/digest", async (req: Request, res: Response) => {
-    // 改回 404，这是"包不存在"的标准信号
-    res.status(404).json({ error: "Package not found" });
+app.get([
+    "/v1/conans/:name/:version/:user/:channel/digest",
+    "/v1/conans/:name/:version/:user/:channel/revisions/:rrev/digest",
+    "/v2/conans/:name/:version/:user/:channel/digest",
+    "/v2/conans/:name/:version/:user/:channel/revisions/:rrev/digest"
+], async (req: Request, res: Response) => {
+    try {
+        const { name, version, user, channel } = req.params as Record<string, string>;
+        const packageId = getPackageId(name, version, user, channel);
+        const result = await dynamo.send(new GetCommand({ TableName: PACKAGES_TABLE, Key: { packageId } }));
+        if (result.Item) {
+            // 返回真实的 MD5 或兜底，阻止 CAS 下载并满足 search 校验
+            const snapshot = await getFileSnapshot(packageId);
+            res.json(snapshot);
+        } else {
+            res.status(404).json({ error: "Recipe not found" });
+        }
+    } catch (e) {
+        res.status(500).json({ error: "Internal error" });
+    }
 });
+
+
+
 
 // 默认处理器
 app.use((req: Request, res: Response) => {
